@@ -22,7 +22,7 @@ public class DecryptUtil {
 
     private static final char[] BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".toCharArray();
 
-    private static final String DEFAULT_KEY = "ED7AA06BD8628B55";
+    public static final String DEFAULT_KEY = "ED7AA06BD8628B55";
 
     public static void main(String[] args) throws Exception {
 
