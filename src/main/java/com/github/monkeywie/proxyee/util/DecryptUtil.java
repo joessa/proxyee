@@ -135,4 +135,59 @@ public class DecryptUtil {
             return new String(decryptedBytes, StandardCharsets.UTF_8);
         }
     }
+
+    /**
+     * 解密方法（对应前端的 dataHandle.decrypt）
+     * 与 decryptWsData 的区别是：decrypt 直接使用输入数据，不需要 getBase64String 转换
+     */
+    public static String decrypt(byte[] inputData, String key) throws Exception {
+        try {
+            // 密钥转化为字节数组
+            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+            
+            // 直接使用输入数据进行AES解密（不需要getBase64String转换）
+            byte[] decryptedBytes = aesDecrypt(inputData, keyBytes, "CBC");
+            
+            // 解压并返回
+            return unzip(decryptedBytes);
+        } catch (Exception e) {
+            throw new Exception("Decrypt failed: " + e.getMessage(), e);
+        }
+    }
+
+//    public static String decryptWsData(byte[] inputData, String key) throws Exception {
+//        try {
+//            String base64String = DecryptUtil.getBase64String(inputData);
+//            byte[] aesDecrypt = DecryptUtil.aesDecrypt(base64String, key.getBytes(StandardCharsets.UTF_8), "CBC");
+//            return DecryptUtil.unzip(aesDecrypt);
+//        } catch (Exception e) {
+//            throw new Exception("Decrypt failed: " + e.getMessage(), e);
+//        }
+//    }
+
+    /**
+     * AES解密方法（重载版本，直接接受字节数组）
+     */
+    public static byte[] aesDecrypt(byte[] ciphertext, byte[] keyBytes, String mode) throws Exception {
+        if (mode == null) {
+            mode = "CBC";
+        }
+        
+        // 构造密钥和IV
+        SecretKeySpec keySpec = new SecretKeySpec(keyBytes, "AES");
+        IvParameterSpec ivSpec = new IvParameterSpec(keyBytes); // JS里iv=key
+
+        // 选择模式
+        String transformation = "AES/" + (mode.equalsIgnoreCase("CBC") ? "CBC" : "ECB") + "/PKCS5Padding";
+        Cipher cipher = Cipher.getInstance(transformation);
+
+        if (mode.equalsIgnoreCase("CBC")) {
+            cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec);
+        } else {
+            cipher.init(Cipher.DECRYPT_MODE, keySpec);
+        }
+        
+        // 解密
+        return cipher.doFinal(ciphertext);
+    }
 }

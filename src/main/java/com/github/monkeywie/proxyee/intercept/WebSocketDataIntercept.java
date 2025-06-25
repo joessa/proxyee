@@ -26,6 +26,9 @@ public class WebSocketDataIntercept extends HttpProxyIntercept {
 
     private static final String HAND_SHAKE = "/stream/ws/v1/handshake";
 
+    // 暂时关闭丢弃功能
+    private static final boolean DROP_UNDECRYPTED_PACKETS = false;
+
     @Override
     public void afterResponse(Channel clientChannel, Channel proxyChannel, HttpResponse httpResponse,
                               HttpProxyInterceptPipeline pipeline) throws Exception {
@@ -54,8 +57,8 @@ public class WebSocketDataIntercept extends HttpProxyIntercept {
             // 延迟添加拦截器，等待 httpCodec 被移除并确保处理顺序正确
             clientChannel.eventLoop().schedule(() -> {
                 try {
-                    addRawDataHandler(clientChannel, "客户端->服务端");
-                    addRawDataHandler(proxyChannel, "服务端->客户端");
+                    addRawDataHandler(clientChannel, "客户端->代理");
+                    addRawDataHandler(proxyChannel, "服务端->代理");
                     System.out.println("=== WebSocket 原始数据监听器已添加 ===");
                 } catch (Exception e) {
                     System.err.println("添加原始数据监听器失败: " + e.getMessage());
@@ -85,21 +88,23 @@ public class WebSocketDataIntercept extends HttpProxyIntercept {
 //            System.out.println("Channel 类型: " + channel.getClass().getSimpleName());
 //            System.out.println("Channel 是否活跃: " + channel.isActive());
 
-            // 创建原始数据处理器（同时处理入站和出站）
+            // 创建原始数据处理器（只处理入站数据，不处理出站数据）
             io.netty.channel.ChannelDuplexHandler rawDataHandler = new io.netty.channel.ChannelDuplexHandler() {
                 @Override
                 public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-//                    System.out.println("🔍 [" + direction + "] 收到消息: " + msg.getClass().getSimpleName() +
-//                        ", WebSocket已升级: " + isWebSocketUpgraded);
-//                    System.out.println("📦  Websocket消息:[" + direction + "]"+ " 时间:" + dateFormat.format(new Date()) + " Host:" + host);
-
                     // 只在 WebSocket 升级后拦截数据
                     if (isWebSocketUpgraded && msg instanceof ByteBuf) {
                         ByteBuf byteBuf = (ByteBuf) msg;
-//                        System.out.println("🔍 [" + direction + "] ByteBuf 可读字节: " + byteBuf.readableBytes());
                         if (byteBuf.readableBytes() > 0) {
-//                            System.out.println("✅ 拦截到原始数据 [" + direction + "]");
-                            printWebSocketData(direction, byteBuf);
+                            // 检查是否需要丢弃这个数据包
+                            if (shouldDropPacket(byteBuf)) {
+                                System.out.println("🚫 丢弃无法解密的数据包 [" + direction + "] 时间:" + dateFormat.format(new Date()) + " 大小:" + byteBuf.readableBytes() + "字节");
+                                // 释放 ByteBuf 但不传递
+                                byteBuf.release();
+                                return; // 不调用 ctx.fireChannelRead(msg)
+                            } else {
+                                printWebSocketData(direction, byteBuf);
+                            }
                         }
                     } else if (isWebSocketUpgraded) {
                         System.out.println("⚠️ [" + direction + "] WebSocket已升级但收到非ByteBuf数据: " + msg.getClass().getSimpleName());
@@ -116,19 +121,7 @@ public class WebSocketDataIntercept extends HttpProxyIntercept {
 
                 @Override
                 public void write(ChannelHandlerContext ctx, Object msg, io.netty.channel.ChannelPromise promise) throws Exception {
-
-//                    System.out.println("📤 [" + direction + "] 出站消息: " + msg.getClass().getSimpleName() +
-//                        ", WebSocket已升级: " + isWebSocketUpgraded);
-//                    System.out.println("📤  Websocket消息:[" + direction + "]"+ " 时间:" + dateFormat.format(new Date()) + " Host:" + host);
-
-                    if (isWebSocketUpgraded && msg instanceof ByteBuf) {
-                        ByteBuf byteBuf = (ByteBuf) msg;
-//                        System.out.println("📦 [" + direction + "] 出站 ByteBuf 可读字节: " + byteBuf.readableBytes());
-                        if (byteBuf.readableBytes() > 0) {
-//                            System.out.println("✅ 拦截到出站数据 [" + direction + "]");
-                            printWebSocketData(direction, byteBuf);
-                        }
-                    }
+                    // 不处理出站数据，直接传递
                     ctx.write(msg, promise);
                 }
 
@@ -196,15 +189,24 @@ public class WebSocketDataIntercept extends HttpProxyIntercept {
                         return;
                     }
 
-                    // 尝试解密
+                    // 先尝试使用原来的密钥
                     String base64String = DecryptUtil.getBase64String(payload);
                     byte[] aesDecrypt = DecryptUtil.aesDecrypt(base64String, DecryptUtil.DEFAULT_KEY.getBytes(StandardCharsets.UTF_8), "CBC");
                     String jsonData = DecryptUtil.unzip(aesDecrypt);
 
-                    System.out.println("📤  Websocket消息:[" + direction + "]" + " 时间:" + dateFormat.format(new Date()) + " Host:" + host + " URL:" + url + " 内容: " + jsonData);
-                } catch (Exception e) {
-                    // 解密失败，尝试多种方式处理
-                    handleDecryptFailure(direction, payload, frameType, opcode);
+                    System.out.println("📤  Websocket消息-decryptWsData:[" + direction + "]" + " 时间:" + dateFormat.format(new Date()) + " Host:" + host + " URL:" + url + " 内容: " + jsonData);
+                } catch (Exception e1) {
+                    // 第一个密钥失败，尝试第二个密钥
+                    try {
+                        byte[] aesDecrypt = DecryptUtil.aesDecrypt(payload, DecryptUtil.DEFAULT_KEY.getBytes(StandardCharsets.UTF_8),"CBC");
+                        String jsonData = DecryptUtil.unzip(aesDecrypt);
+                        System.out.println("📤  Websocket消息-aesDecrypt:[" + direction + "]" + " 时间:" + dateFormat.format(new Date()) + " Host:" + host + " URL:" + url + " 内容: " + jsonData);
+                    } catch (Exception e2) {
+                        // 两个密钥都失败，进行详细分析
+                            // 直接转换为base64并打印
+                        String base64Data = java.util.Base64.getEncoder().encodeToString(payload);
+                        System.out.println("📦  Base64数据 [" + direction + "] 时间:" + dateFormat.format(new Date()) + " Host:" + host + " URL:" + url + " Base64: " + base64Data);
+                    }
                 }
             } else {
                 System.out.println("⚠️  无法提取WebSocket payload数据 [" + direction + "] 帧类型: " + frameType);
@@ -217,50 +219,262 @@ public class WebSocketDataIntercept extends HttpProxyIntercept {
     }
 
     /**
+     * 分析解密失败的数据包
+     */
+    private void analyzeFailedPayload(String direction, byte[] payload, String frameType, Exception e1, Exception e2) {
+        System.out.println("🔍 两个密钥都解密失败 [" + direction + "] 时间:" + dateFormat.format(new Date()) + " 帧类型:" + frameType + " 大小:" + payload.length + "字节");
+        System.out.println("🔍 错误1: " + e1.getMessage());
+        System.out.println("🔍 错误2: " + e2.getMessage());
+
+        // 检查数据特征
+        System.out.println(" 数据特征分析:");
+        System.out.println("  - 数据长度: " + payload.length + " 字节");
+        System.out.println("  - 是否为16的倍数: " + (payload.length % 16 == 0));
+        System.out.println("  - 前16字节: " + bytesToHex(payload, 16));
+
+        // 检查是否是压缩数据
+        if (payload.length >= 2) {
+            int firstByte = payload[0] & 0xFF;
+            int secondByte = payload[1] & 0xFF;
+            System.out.println("  - 前两个字节: " + String.format("%02X %02X", firstByte, secondByte));
+
+            // 检查GZIP魔数
+            if (firstByte == 0x1F && secondByte == 0x8B) {
+                System.out.println("  - 检测到GZIP压缩数据");
+                try {
+                    String unzipped = DecryptUtil.unzip(payload);
+                    System.out.println("  - GZIP解压结果: " + unzipped);
+                    return;
+                } catch (Exception ex) {
+                    System.out.println("  - GZIP解压失败: " + ex.getMessage());
+                }
+            }
+
+            // 检查ZIP魔数
+            if (payload.length >= 4 && firstByte == 0x50 && secondByte == 0x4B) {
+                System.out.println("  - 检测到ZIP压缩数据");
+            }
+
+            // 检查zlib魔数
+            if (secondByte == 0x01 || secondByte == 0x9C || secondByte == 0xDA) {
+                System.out.println("  - 检测到zlib压缩数据");
+            }
+
+            // 检查是否是Protobuf或其他二进制格式
+            if (firstByte == 0x99 && secondByte == 0x70) {
+                System.out.println("  - 检测到可能的Protobuf或自定义二进制格式");
+                analyzeBinaryFormat(payload);
+                return;
+            }
+        }
+
+        // 尝试多种编码方式
+        System.out.println("  - 尝试多种编码方式:");
+
+        boolean foundReadableText = false;
+
+        // UTF-8
+        try {
+            String utf8Text = new String(payload, StandardCharsets.UTF_8);
+            System.out.println("  - UTF-8解码结果: " + utf8Text);
+            if (isLikelyText(utf8Text)) {
+                System.out.println("  - UTF-8解码成功，发现可读文本!");
+                foundReadableText = true;
+            }
+        } catch (Exception ex) {
+            System.out.println("  - UTF-8解码失败: " + ex.getMessage());
+        }
+
+        // GBK
+        try {
+            String gbkText = new String(payload, "GBK");
+            System.out.println("  - GBK解码结果: " + gbkText);
+            if (isLikelyText(gbkText)) {
+                System.out.println("  - GBK解码成功，发现可读文本!");
+                foundReadableText = true;
+            }
+        } catch (Exception ex) {
+            System.out.println("  - GBK解码失败: " + ex.getMessage());
+        }
+
+        // GB2312
+        try {
+            String gb2312Text = new String(payload, "GB2312");
+            System.out.println("  - GB2312解码结果: " + gb2312Text);
+            if (isLikelyText(gb2312Text)) {
+                System.out.println("  - GB2312解码成功，发现可读文本!");
+                foundReadableText = true;
+            }
+        } catch (Exception ex) {
+            System.out.println("  - GB2312解码失败: " + ex.getMessage());
+        }
+
+        // Big5
+        try {
+            String big5Text = new String(payload, "Big5");
+            System.out.println("  - Big5解码结果: " + big5Text);
+            if (isLikelyText(big5Text)) {
+                System.out.println("  - Big5解码成功，发现可读文本!");
+                foundReadableText = true;
+            }
+        } catch (Exception ex) {
+            System.out.println("  - Big5解码失败: " + ex.getMessage());
+        }
+
+        // ISO-8859-1
+        try {
+            String isoText = new String(payload, "ISO-8859-1");
+            System.out.println("  - ISO-8859-1解码结果: " + isoText);
+            if (isLikelyText(isoText)) {
+                System.out.println("  - ISO-8859-1解码成功，发现可读文本!");
+                foundReadableText = true;
+            }
+        } catch (Exception ex) {
+            System.out.println("  - ISO-8859-1解码失败: " + ex.getMessage());
+        }
+
+        // UTF-16
+        try {
+            String utf16Text = new String(payload, "UTF-16");
+            System.out.println("  - UTF-16解码结果: " + utf16Text);
+            if (isLikelyText(utf16Text)) {
+                System.out.println("  - UTF-16解码成功，发现可读文本!");
+                foundReadableText = true;
+            }
+        } catch (Exception ex) {
+            System.out.println("  - UTF-16解码失败: " + ex.getMessage());
+        }
+
+        // UTF-16LE
+        try {
+            String utf16leText = new String(payload, "UTF-16LE");
+            System.out.println("  - UTF-16LE解码结果: " + utf16leText);
+            if (isLikelyText(utf16leText)) {
+                System.out.println("  - UTF-16LE解码成功，发现可读文本!");
+                foundReadableText = true;
+            }
+        } catch (Exception ex) {
+            System.out.println("  - UTF-16LE解码失败: " + ex.getMessage());
+        }
+
+        // UTF-16BE
+        try {
+            String utf16beText = new String(payload, "UTF-16BE");
+            System.out.println("  - UTF-16BE解码结果: " + utf16beText);
+            if (isLikelyText(utf16beText)) {
+                System.out.println("  - UTF-16BE解码成功，发现可读文本!");
+                foundReadableText = true;
+            }
+        } catch (Exception ex) {
+            System.out.println("  - UTF-16BE解码失败: " + ex.getMessage());
+        }
+
+        // 检查是否是Base64编码的字符串
+        try {
+            String base64String = new String(payload, StandardCharsets.UTF_8);
+            if (base64String.matches("^[A-Za-z0-9+/]*={0,2}$")) {
+                System.out.println("  - 检测到Base64编码字符串: " + base64String);
+                // 尝试解码Base64
+                byte[] decoded = java.util.Base64.getDecoder().decode(base64String);
+                System.out.println("  - Base64解码后长度: " + decoded.length + " 字节");
+                System.out.println("  - Base64解码后前16字节: " + bytesToHex(decoded, 16));
+                return;
+            }
+        } catch (Exception ex) {
+            // 忽略Base64解码失败
+        }
+
+        // 检查是否是其他加密方式
+        if (payload.length % 16 == 0) {
+            System.out.println("  - 数据长度是16的倍数，可能是其他加密方式");
+            System.out.println("  - 尝试分析加密特征:");
+
+            // 检查是否有重复模式
+            boolean hasRepeatingPattern = false;
+            for (int i = 0; i < payload.length - 16; i += 16) {
+                for (int j = i + 16; j < payload.length - 16; j += 16) {
+                    boolean match = true;
+                    for (int k = 0; k < 16; k++) {
+                        if (payload[i + k] != payload[j + k]) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        hasRepeatingPattern = true;
+                        System.out.println("  - 发现重复的16字节块: 位置 " + i + " 和 " + j);
+                        break;
+                    }
+                }
+                if (hasRepeatingPattern) break;
+            }
+
+            if (!hasRepeatingPattern) {
+                System.out.println("  - 没有发现明显的重复模式");
+            }
+        }
+
+        if (!foundReadableText) {
+            System.out.println("  - 所有编码方式都未能产生可读文本，可能是加密数据");
+        }
+
+        // 最后输出base64
+        System.out.println("  - 输出Base64:");
+        handleDecryptFailure(direction, payload, host, url);
+    }
+
+    /**
+     * 分析二进制格式数据
+     */
+    private void analyzeBinaryFormat(byte[] payload) {
+        System.out.println("  - 二进制格式分析:");
+
+        // 检查前几个字节的模式
+        if (payload.length >= 8) {
+            System.out.println("  - 前8字节: " + bytesToHex(payload, 8));
+
+            // 检查是否有长度字段
+            int possibleLength1 = ((payload[2] & 0xFF) << 8) | (payload[3] & 0xFF);
+            int possibleLength2 = ((payload[4] & 0xFF) << 8) | (payload[5] & 0xFF);
+            int possibleLength3 = ((payload[6] & 0xFF) << 8) | (payload[7] & 0xFF);
+
+            System.out.println("  - 可能的长度字段1 (字节2-3): " + possibleLength1);
+            System.out.println("  - 可能的长度字段2 (字节4-5): " + possibleLength2);
+            System.out.println("  - 可能的长度字段3 (字节6-7): " + possibleLength3);
+
+            // 检查是否有JSON特征
+            for (int i = 0; i < Math.min(payload.length, 100); i++) {
+                if (payload[i] == '{' || payload[i] == '[' || payload[i] == '"') {
+                    System.out.println("  - 在位置 " + i + " 发现JSON字符: " + (char)payload[i]);
+                    // 尝试从该位置开始解析
+                    try {
+                        String jsonPart = new String(payload, i, Math.min(payload.length - i, 200), StandardCharsets.UTF_8);
+                        System.out.println("  - 可能的JSON片段: " + jsonPart);
+                    } catch (Exception ex) {
+                        // 忽略
+                    }
+                    break;
+                }
+            }
+        }
+
+        // 检查数据分布
+        int zeroCount = 0, printableCount = 0, controlCount = 0;
+        for (int i = 0; i < Math.min(payload.length, 100); i++) {
+            if (payload[i] == 0) zeroCount++;
+            else if (payload[i] >= 32 && payload[i] <= 126) printableCount++;
+            else controlCount++;
+        }
+        System.out.println("  - 数据分布 (前100字节): 零字节=" + zeroCount + ", 可打印=" + printableCount + ", 控制字符=" + controlCount);
+    }
+
+    /**
      * 处理解密失败的情况
      */
-    private void handleDecryptFailure(String direction, byte[] payload, String frameType, int opcode) {
-        try {
-            // 根据帧类型决定处理方式
-            if (opcode == 0x8) { // 连接关闭帧
-                String reason = payload.length >= 2 ? new String(payload, 2, payload.length - 2, StandardCharsets.UTF_8) : "无原因";
-                int code = payload.length >= 2 ? ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF) : 0;
-                System.out.println("🔌  WebSocket关闭 [" + direction + "] 时间:" + dateFormat.format(new Date()) + " 关闭码:" + code + " 原因:" + reason);
-                return;
-            } else if (opcode == 0x9) { // Ping帧
-                System.out.println("💓  WebSocket Ping [" + direction + "] 时间:" + dateFormat.format(new Date()) + " 数据:" + bytesToHex(payload, 32));
-                return;
-            } else if (opcode == 0xA) { // Pong帧
-                System.out.println("💓  WebSocket Pong [" + direction + "] 时间:" + dateFormat.format(new Date()) + " 数据:" + bytesToHex(payload, 32));
-                return;
-            }
-
-            // 尝试UTF-8解码
-            String utf8Text = new String(payload, StandardCharsets.UTF_8);
-            if (isLikelyText(utf8Text)) {
-                System.out.println("📧  UTF-8文本 [" + direction + "] 时间:" + dateFormat.format(new Date()) + " 帧类型:" + frameType + " 内容: " + utf8Text);
-                return;
-            }
-
-            // 尝试GBK解码
-            String gbkText = new String(payload, "GBK");
-            if (isLikelyText(gbkText)) {
-                System.out.println("📧  GBK文本 [" + direction + "] 时间:" + dateFormat.format(new Date()) + " 帧类型:" + frameType + " 内容: " + gbkText);
-                return;
-            }
-
-            // 检查是否可能是压缩数据
-            if (isLikelyCompressed(payload)) {
-                System.out.println("📦  疑似压缩数据 [" + direction + "] 时间:" + dateFormat.format(new Date()) + " 帧类型:" + frameType + " 大小:" + payload.length + "字节 HEX: " + bytesToHex(payload, 64));
-                return;
-            }
-
-            // 都不像文本，输出十六进制
-            System.out.println("📦  二进制数据 [" + direction + "] 时间:" + dateFormat.format(new Date()) + " 帧类型:" + frameType + " 大小:" + payload.length + "字节 HEX: " + bytesToHex(payload, 128));
-
-        } catch (Exception ex) {
-            System.out.println("📦  处理失败，显示十六进制: " + bytesToHex(payload, 64));
-        }
+    private void handleDecryptFailure(String direction, byte[] payload, String host, String url) {
+        // 直接转换为base64并打印
+        String base64Data = java.util.Base64.getEncoder().encodeToString(payload);
+        System.out.println("📦  Base64数据 [" + direction + "] 时间:" + dateFormat.format(new Date()) + " Host:" + host + " URL:" + url + " Base64: " + base64Data);
     }
 
     /**
@@ -445,5 +659,59 @@ public class WebSocketDataIntercept extends HttpProxyIntercept {
             result.append("\n... (还有 ").append(bytes.length - maxLength).append(" 字节)");
         }
         return result.toString();
+    }
+
+    /**
+     * 检查是否应该丢弃这个数据包
+     */
+    private boolean shouldDropPacket(ByteBuf byteBuf) {
+        if (!DROP_UNDECRYPTED_PACKETS) {
+            return false; // 如果开关关闭，不丢弃任何包
+        }
+
+        try {
+            // 保存当前读取位置
+            int readerIndex = byteBuf.readerIndex();
+
+            // 读取数据（不改变 ByteBuf 的读取位置）
+            byte[] data = new byte[Math.min(byteBuf.readableBytes(), 1024)];
+            byteBuf.getBytes(readerIndex, data);
+
+            // 检查WebSocket帧类型
+            int opcode = data.length > 0 ? (data[0] & 0x0F) : -1;
+
+            // 不丢弃控制帧（Ping, Pong, Close等）
+            // if (opcode == 0x8 || opcode == 0x9 || opcode == 0xA) {
+            //     System.out.println("🔒 保留控制帧 [" + getOpcodeDescription(opcode) + "]");
+            //     return false;
+            // }
+
+            // 提取WebSocket payload数据
+            byte[] payload = extractWebSocketPayload(data);
+            if (payload != null && payload.length > 0) {
+                try {
+                    // 特殊处理握手URL - 不丢弃握手数据
+                    if (url.contains(HAND_SHAKE)) {
+                        return false;
+                    }
+
+                    // 尝试解密
+                    String base64String = DecryptUtil.getBase64String(payload);
+                    byte[] aesDecrypt = DecryptUtil.aesDecrypt(base64String, DecryptUtil.DEFAULT_KEY.getBytes(StandardCharsets.UTF_8), "CBC");
+                    String jsonData = DecryptUtil.unzip(aesDecrypt);
+                
+                    // 解密成功，不丢弃
+                    return false;
+                } catch (Exception e) {
+                    // 解密失败，记录详细信息
+                    System.out.println("🔍 解密失败的数据包 [" + getOpcodeDescription(opcode) + "] 大小:" + payload.length + "字节");
+                    return true; // 丢弃
+                }
+            }
+            
+            return false; // 无法提取payload，不丢弃
+        } catch (Exception e) {
+            return false; // 出错时不丢弃
+        }
     }
 } 
